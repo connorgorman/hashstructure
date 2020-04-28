@@ -28,6 +28,11 @@ type HashOptions struct {
 	// By default this is "hash".
 	TagName string
 
+	// TagOnly specifies that we only want to hash the data that either has
+	// the tag name directly applied with a valid value OR if a parent has the
+	// tag
+	TagOnly bool
+
 	// ZeroNil is flag determining if nil pointer should be treated equal
 	// to a zero value of pointed type. By default this is false.
 	ZeroNil bool
@@ -84,14 +89,17 @@ func Hash(v interface{}, opts *HashOptions) (uint64, error) {
 	w := &walker{
 		h:       opts.Hasher,
 		tag:     opts.TagName,
+		tagOnly: opts.TagOnly,
 		zeronil: opts.ZeroNil,
 	}
-	return w.visit(reflect.ValueOf(v), nil)
+	val, _, err := w.visit(reflect.ValueOf(v), &visitOpts{})
+	return val, err
 }
 
 type walker struct {
 	h       hash.Hash64
 	tag     string
+	tagOnly bool
 	zeronil bool
 }
 
@@ -102,9 +110,24 @@ type visitOpts struct {
 	// Information about the struct containing this field
 	Struct      interface{}
 	StructField string
+	Tag         string
 }
 
-func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
+func (w *walker) hasRequiredTag(tag string) bool {
+	if !w.tagOnly {
+		return true
+	}
+	return tag != "" && tag != "ignore" && tag != "-"
+}
+
+func tagOrParent(tag string, opts *visitOpts) string {
+	if tag != "" {
+		return tag
+	}
+	return opts.Tag
+}
+
+func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, bool, error) {
 	t := reflect.TypeOf(0)
 
 	// Loop since these can be wrapped in multiple layers of pointers
@@ -153,10 +176,14 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 
 	// We can shortcut numeric values by directly binary writing them
 	if k >= reflect.Int && k <= reflect.Complex64 {
+		if !w.hasRequiredTag(opts.Tag) {
+			return 0, false, nil
+		}
+
 		// A direct hash calculation
 		w.h.Reset()
 		err := binary.Write(w.h, binary.LittleEndian, v.Interface())
-		return w.h.Sum64(), err
+		return w.h.Sum64(), true, err
 	}
 
 	switch k {
@@ -164,15 +191,20 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 		var h uint64
 		l := v.Len()
 		for i := 0; i < l; i++ {
-			current, err := w.visit(v.Index(i), nil)
+			current, valid, err := w.visit(v.Index(i), &visitOpts{
+				Tag: opts.Tag,
+			})
 			if err != nil {
-				return 0, err
+				return 0, false, err
+			}
+			if !valid {
+				continue
 			}
 
 			h = hashUpdateOrdered(w.h, h, current)
 		}
 
-		return h, nil
+		return h, true, nil
 
 	case reflect.Map:
 		var includeMap IncludableMap
@@ -191,27 +223,36 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 				incl, err := includeMap.HashIncludeMap(
 					opts.StructField, k.Interface(), v.Interface())
 				if err != nil {
-					return 0, err
+					return 0, false, err
 				}
 				if !incl {
 					continue
 				}
 			}
-
-			kh, err := w.visit(k, nil)
+			kh, valid, err := w.visit(k, &visitOpts{
+				Tag: opts.Tag,
+			})
 			if err != nil {
-				return 0, err
+				return 0, false, err
 			}
-			vh, err := w.visit(v, nil)
+			if !valid {
+				continue
+			}
+			vh, valid, err := w.visit(v, &visitOpts{
+				Tag: opts.Tag,
+			})
 			if err != nil {
-				return 0, err
+				return 0, false, err
+			}
+			if !valid {
+				continue
 			}
 
 			fieldHash := hashUpdateOrdered(w.h, kh, vh)
 			h = hashUpdateUnordered(h, fieldHash)
 		}
 
-		return h, nil
+		return h, true, nil
 
 	case reflect.Struct:
 		parent := v.Interface()
@@ -221,9 +262,11 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 		}
 
 		t := v.Type()
-		h, err := w.visit(reflect.ValueOf(t.Name()), nil)
+		h, _, err := w.visit(reflect.ValueOf(t.Name()), &visitOpts{
+			Tag: opts.Tag,
+		})
 		if err != nil {
-			return 0, err
+			return 0, false, err
 		}
 
 		l := v.NumField()
@@ -247,7 +290,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 					if impl, ok := innerV.Interface().(fmt.Stringer); ok {
 						innerV = reflect.ValueOf(impl.String())
 					} else {
-						return 0, &ErrNotStringer{
+						return 0, false, &ErrNotStringer{
 							Field: v.Type().Field(i).Name,
 						}
 					}
@@ -257,7 +300,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 				if include != nil {
 					incl, err := include.HashInclude(fieldType.Name, innerV)
 					if err != nil {
-						return 0, err
+						return 0, false, err
 					}
 					if !incl {
 						continue
@@ -269,18 +312,27 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 					f |= visitFlagSet
 				}
 
-				kh, err := w.visit(reflect.ValueOf(fieldType.Name), nil)
+				kh, valid, err := w.visit(reflect.ValueOf(fieldType.Name), &visitOpts{
+					Tag: tagOrParent(tag, opts),
+				})
 				if err != nil {
-					return 0, err
+					return 0, false, err
+				}
+				if !valid {
+					continue
 				}
 
-				vh, err := w.visit(innerV, &visitOpts{
+				vh, valid, err := w.visit(innerV, &visitOpts{
 					Flags:       f,
 					Struct:      parent,
 					StructField: fieldType.Name,
+					Tag:         tagOrParent(tag, opts),
 				})
 				if err != nil {
-					return 0, err
+					return 0, false, err
+				}
+				if !valid {
+					continue
 				}
 
 				fieldHash := hashUpdateOrdered(w.h, kh, vh)
@@ -288,7 +340,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 			}
 		}
 
-		return h, nil
+		return h, true, nil
 
 	case reflect.Slice:
 		// We have two behaviors here. If it isn't a set, then we just
@@ -301,9 +353,14 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 		}
 		l := v.Len()
 		for i := 0; i < l; i++ {
-			current, err := w.visit(v.Index(i), nil)
+			current, valid, err := w.visit(v.Index(i), &visitOpts{
+				Tag: opts.Tag,
+			})
 			if err != nil {
-				return 0, err
+				return 0, false, err
+			}
+			if !valid {
+				continue
 			}
 
 			if set {
@@ -313,16 +370,19 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 			}
 		}
 
-		return h, nil
+		return h, true, nil
 
 	case reflect.String:
+		if !w.hasRequiredTag(opts.Tag) {
+			return 0, false, nil
+		}
 		// Directly hash
 		w.h.Reset()
 		_, err := w.h.Write([]byte(v.String()))
-		return w.h.Sum64(), err
+		return w.h.Sum64(), true, err
 
 	default:
-		return 0, fmt.Errorf("unknown kind to hash: %s", k)
+		return 0, false, fmt.Errorf("unknown kind to hash: %s", k)
 	}
 
 }
